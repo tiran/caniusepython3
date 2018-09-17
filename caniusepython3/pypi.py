@@ -14,9 +14,12 @@
 
 from __future__ import unicode_literals
 
+from distlib.wheel import Wheel
 import packaging.utils
+import packaging.version
 import requests
 
+import enum
 import concurrent.futures
 import datetime
 import json
@@ -30,14 +33,17 @@ try:
 except ImportError:
     from backports.functools_lru_cache import lru_cache
 
-
-
-try:
-    CPU_COUNT = max(2, multiprocessing.cpu_count())
-except NotImplementedError:  #pragma: no cover
-    CPU_COUNT = 2
-
 PROJECT_NAME = re.compile(r'[\w.-]+')
+
+
+class CanIUsePython3(enum.Enum):
+    def __bool__(self):
+        return self not in (self.python2_only, self.unknown)
+
+    unknown = 'unknown (Python 2 only assumed)'
+    python2_only = 'Python 2 only'
+    python3_supported = 'Python 3 supported'
+    python3_only = 'Python 3 only'
 
 
 def just_name(supposed_name):
@@ -75,16 +81,96 @@ def _manual_overrides(_cache_date=None):
     return frozenset(map(packaging.utils.canonicalize_name, overrides.keys()))
 
 
+def _classifiy(project_name, response):
+    """Parse JSON response to look for Python 2 / 3 support
+
+    First of all, check 'Programming Language :: Python :: *' classifiers
+    for Python 2 and 3 classifiers. In case the project has no classifiers
+    with Python versions, the algorithm falls back to wheel file names.
+
+    response["info"]["requires_python"] is ignored for now. Any package with
+    requires_python flags will most likely have proper classifiers, too.
+    """
+    log = logging.getLogger("ciu")
+    py2 = py3 = None
+    cs = response["info"]["classifiers"]
+    has_classifier = any(
+        c.startswith('Programming Language :: Python :: ') for c in cs
+    )
+    if has_classifier:
+        # Project has at least one Python version classifier.
+        log.debug("%s has Python version classifiers", project_name)
+        if 'Programming Language :: Python :: 3 :: Only' in cs:
+            log.debug("%s is Python 3 only", project_name)
+            return CanIUsePython3.python3_only
+        if 'Programming Language :: Python :: 2 :: Only' in cs:
+            log.debug("%s is Python 2 only", project_name)
+            return CanIUsePython3.python2_only
+        # Let's assume that missing Python 2/3 classifier means that project
+        # doesn't support that major version.
+        py2 = any(
+            c.startswith("Programming Language :: Python :: 2") for c in cs
+        )
+        py3 = any(
+            c.startswith("Programming Language :: Python :: 3") for c in cs
+        )
+    else:
+        # No classifiers found, now look for wheels in latest release.
+        if not response.get('releases'):
+            log.debug('%s has no releases', project_name)
+            return CanIUsePython3.unknown
+
+        # Check wheels of the highest version.
+        latest = str(max(
+            packaging.version.parse(v) for v in response['releases']
+        ))
+        wheel_names = [
+            dl['filename'] for dl in response['releases'][latest]
+            if dl['packagetype'] == 'bdist_wheel'
+        ]
+        if not wheel_names:
+            log.debug('%s == %s has no wheels', project_name, latest)
+            return CanIUsePython3.unknown
+
+        # Check tags of all wheels of highest version.
+        log.debug('Checking wheels %s', ', '.join(wheel_names))
+        for wheel_name in wheel_names:
+            wheel = Wheel(wheel_name)
+            for pyver, abi, arch in wheel.tags:
+                if pyver.startswith(('py2', 'cp2')):
+                    py2 = True
+                elif pyver.startswith(('py3', 'cp3')):
+                    py3 = True
+            if py2 and py3:
+                break
+
+    log.debug("%s has py2 %s, py3 %s", project_name, py2, py3)
+    if py3 and py2:
+        return CanIUsePython3.python3_supported
+    elif py3:
+        return CanIUsePython3.python3_only
+    elif py2:
+        return CanIUsePython3.python2_only
+    else:
+        # Unknown or unsupported pyver wheel tags.
+        return CanIUsePython3.unknown
+
+
+# Create a shared request session to benefit from persistent connections.
+# HTTP keep-alive speeds up py3readiness generator a *lot*.
+_session = requests.session()
+
+
+@lru_cache(maxsize=1024)
 def supports_py3(project_name):
     """Check with PyPI if a project supports Python 3."""
     log = logging.getLogger("ciu")
     log.info("Checking {} ...".format(project_name))
-    request = requests.get("https://pypi.org/pypi/{}/json".format(project_name))
+    request = _session.get("https://pypi.org/pypi/{}/json".format(project_name))
     if request.status_code >= 400:
         log = logging.getLogger("ciu")
         log.warning("problem fetching {}, assuming ported ({})".format(
                         project_name, request.status_code))
-        return True
+        return CanIUsePython3.python3_supported
     response = request.json()
-    return any(c.startswith("Programming Language :: Python :: 3")
-               for c in response["info"]["classifiers"])
+    return _classifiy(project_name, response)

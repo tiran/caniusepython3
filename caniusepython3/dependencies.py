@@ -69,7 +69,7 @@ def blockers(project_names):
 
     def supports_py3(project_name):
         if project_name in overrides:
-            return True
+            return pypi.CanIUsePython3.python3_supported
         else:
             return pypi.supports_py3(project_name)
 

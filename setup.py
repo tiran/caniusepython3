@@ -25,6 +25,7 @@ setup(name='caniusepython3',
       install_requires=['distlib', 'setuptools', 'packaging',  # Input flexibility
                         'argparse', 'backports.functools_lru_cache',
                         'futures ; python_version=="2.7"',
+                        'enum34 ; python_version=="2.7"',
                         'requests'],  # Functionality
       tests_require=tests_require,  # Testing, external due to Travis
       test_suite='caniusepython3.test',
